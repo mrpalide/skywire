@@ -12,7 +12,7 @@ jobs:
         with:
           go-version: 1.19.x
       - uses: actions/checkout@v3
-      # this added for skip make release on other branches and PRs
+      # this added for skip make releasse on other branches and PRs
       - name: Install Requirements
         run: |
           sudo apt update
