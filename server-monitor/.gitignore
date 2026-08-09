@@ -1,0 +1,6 @@
+# Cross-compiled binaries from build.sh
+dist/
+server-monitor
+
+# Recorded runs (samples.jsonl, report.txt, profiles)
+server-monitor-*/

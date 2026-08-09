@@ -1,0 +1,66 @@
+[Unit]
+# Unattended host + dmsg-server diagnostics. Install alongside the service you
+# are investigating; it is a recorder, not part of the deployment.
+#
+#   install -m755 server-monitor /usr/local/bin/server-monitor
+#   install -m644 skywire-monitor.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now skywire-monitor
+#
+# Watch it:      journalctl -u skywire-monitor -f
+# Read a report: cat /var/log/skywire-monitor/*/report.txt
+# Stop cleanly:  systemctl stop skywire-monitor
+Description=Skywire server-monitor (host + dmsg-server diagnostics)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# Root is required for the good data, not for privilege escalation:
+# /proc/<pid>/fd is readable only by the process owner or root, and that fd ->
+# socket-inode mapping is what attributes each connection — and so each peer's
+# traffic — to the dmsg-server rather than to "something on this box".
+# Without it the tool falls back to matching by listening port.
+User=root
+Group=root
+
+# A fresh, timestamped output directory per start (the default when -dir is
+# omitted). Do NOT pin -dir to a fixed path: samples.jsonl is opened for
+# append, so a restart would splice a second run into the first one's timeline.
+WorkingDirectory=/var/log/skywire-monitor
+ExecStartPre=/bin/mkdir -p /var/log/skywire-monitor
+
+# -duration 24h with Restart=always gives daily rotation: bounded files, one
+# self-contained report per day, continuous coverage. A clean `systemctl stop`
+# still stops it — systemd does not re-run a unit that was explicitly stopped.
+#
+# -print-every 5m keeps the journal readable; the live line is a status
+# heartbeat, not the product. The product is report.txt.
+#
+# Add -mbit-spike <N> matching your traffic alert's own threshold to capture a
+# CPU profile at the moment the alert fires (needs the server's pprof endpoint;
+# see the README).
+ExecStart=/usr/local/bin/server-monitor watch -duration 24h -print-every 5m
+
+# On SIGTERM the monitor finishes the current tick, then renders report.txt
+# before exiting. Give it room to do that: rendering re-reads samples.jsonl,
+# which is large after a full day.
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=300
+
+# Deliberately NOT niced and NOT IO-deprioritised. The entire point is to keep
+# sampling while the box is saturated; a low-priority monitor gets descheduled
+# exactly during the spike it was installed to measure, leaving a hole in the
+# timeline where the evidence should be.
+
+Restart=always
+RestartSec=5
+
+# The samples are diagnostics about this host, so keep them to this host.
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=no
+
+[Install]
+WantedBy=multi-user.target
