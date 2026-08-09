@@ -64,14 +64,14 @@ reboot may be the very incident you are chasing.
 
 ```bash
 install -m755 dist/server-monitor-linux-amd64 /usr/local/bin/server-monitor
-install -m644 skywire-monitor.service /etc/systemd/system/
-systemctl daemon-reload && systemctl enable --now skywire-monitor
+install -m644 server-monitor.service /etc/systemd/system/
+systemctl daemon-reload && systemctl enable --now server-monitor
 ```
 
 ```bash
-journalctl -u skywire-monitor -f          # live status line
-cat /var/log/skywire-monitor/*/report.txt # the current report, any time
-systemctl stop skywire-monitor            # SIGTERM -> final report is written
+journalctl -u server-monitor -f          # live status line
+cat /var/log/server-monitor/*/report.txt # the current report, any time
+systemctl stop server-monitor            # SIGTERM -> final report is written
 ```
 
 The shipped unit runs as root, rotates daily (`-duration 24h` with
@@ -91,7 +91,7 @@ whatever was recorded.
 Runs accumulate one directory per day at roughly 50–100 MB each, so prune them:
 
 ```bash
-find /var/log/skywire-monitor -maxdepth 1 -type d -mtime +7 -exec rm -rf {} +
+find /var/log/server-monitor -maxdepth 1 -type d -mtime +7 -exec rm -rf {} +
 ```
 
 For a quick interactive look instead, `tmux new -s monitor` and
