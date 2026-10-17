@@ -7,11 +7,14 @@ import android.content.Intent
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -38,11 +41,13 @@ import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.Download
 import androidx.compose.material.icons.rounded.Edit
+import androidx.compose.material.icons.rounded.PersonAdd
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material.icons.rounded.Share
 import androidx.compose.material.icons.rounded.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -117,15 +122,17 @@ fun MailScreen(onBack: () -> Unit, viewModel: MailViewModel = viewModel()) {
     LaunchedEffect(pending) { if (pending != null) viewModel.onPendingLink() }
 
     val inner = state.draft != null || state.open != null || state.settingsOpen
+    val selecting = state.selection.isNotEmpty()
     val stepBack: () -> Unit = {
         when {
             state.draft != null -> viewModel.discardDraft()
             state.settingsOpen -> viewModel.closeSettings()
             state.open != null -> viewModel.closeMessage()
+            selecting -> viewModel.clearSelection()
             else -> onBack()
         }
     }
-    BackHandler(enabled = inner) { stepBack() }
+    BackHandler(enabled = inner || selecting) { stepBack() }
 
     val listView = !inner && state.coreReady
     Scaffold(
@@ -134,12 +141,13 @@ fun MailScreen(onBack: () -> Unit, viewModel: MailViewModel = viewModel()) {
                 title = when {
                     state.draft != null -> stringResource(R.string.mail_compose_title)
                     state.settingsOpen -> stringResource(R.string.mail_settings_title)
+                    selecting -> stringResource(R.string.mail_selected_count, state.selection.size)
                     else -> stringResource(R.string.app_skymail)
                 },
                 onBack = stepBack,
                 help = HelpTopic(R.string.help_mail_title, R.string.help_mail_body),
                 actions = {
-                    if (listView) {
+                    if (listView && !selecting) {
                         IconButton(onClick = viewModel::openSettings) {
                             Icon(Icons.Rounded.Settings, contentDescription = stringResource(R.string.mail_settings_title))
                         }
@@ -148,8 +156,9 @@ fun MailScreen(onBack: () -> Unit, viewModel: MailViewModel = viewModel()) {
             )
         },
         snackbarHost = { SnackbarHost(snackbar) },
+        bottomBar = { if (selecting) SelectionBar(state, viewModel) },
         floatingActionButton = {
-            if (listView && state.status?.running == true) {
+            if (listView && !selecting && state.status?.running == true) {
                 ExtendedFloatingActionButton(
                     onClick = { viewModel.compose() },
                     icon = { Icon(Icons.Rounded.Edit, contentDescription = null) },
@@ -213,10 +222,70 @@ private fun FolderView(state: MailUiState, viewModel: MailViewModel) {
                     )
                 }
                 else -> items(messages, key = { it.id }) { m ->
-                    MailRow(m, sent = state.folder == MailFolder.SENT) { viewModel.open(state.folder, m) }
+                    MailRow(
+                        m,
+                        sent = state.folder == MailFolder.SENT,
+                        selecting = state.selection.isNotEmpty(),
+                        selected = m.id in state.selection,
+                        onOpen = { viewModel.open(state.folder, m) },
+                        onToggle = { viewModel.toggleSelect(m.id) },
+                    )
                 }
             }
         }
+    }
+}
+
+/** The batch actions, shown while messages are picked. */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun SelectionBar(state: MailUiState, viewModel: MailViewModel) {
+    var confirmDelete by remember { mutableStateOf(false) }
+    Column(Modifier.fillMaxWidth().background(MaterialTheme.colorScheme.background)) {
+        HorizontalDivider()
+        // The verbs wrap rather than truncate: in Spanish the three of them
+        // outrun a phone's width in one row.
+        val listed = state.messages?.size ?: 0
+        FlowRow(
+            horizontalArrangement = Arrangement.spacedBy(4.dp, Alignment.CenterHorizontally),
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 8.dp, vertical = 2.dp),
+        ) {
+            TextButton(onClick = viewModel::selectAll, enabled = state.selection.size < listed) {
+                Text(stringResource(R.string.mail_select_all))
+            }
+            TextButton(onClick = viewModel::invertSelection) {
+                Text(stringResource(R.string.mail_invert_selection))
+            }
+            TextButton(onClick = viewModel::clearSelection, enabled = state.selection.isNotEmpty()) {
+                Text(stringResource(R.string.mail_deselect_all))
+            }
+        }
+        Button(
+            onClick = { confirmDelete = true },
+            enabled = !state.busy,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 6.dp),
+        ) {
+            Text(stringResource(R.string.mail_delete_selected, state.selection.size))
+        }
+    }
+    if (confirmDelete) {
+        AlertDialog(
+            onDismissRequest = { confirmDelete = false },
+            text = { Text(stringResource(R.string.mail_batch_delete_confirm, state.selection.size)) },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmDelete = false
+                    viewModel.deleteSelected()
+                }) { Text(stringResource(R.string.mail_delete)) }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmDelete = false }) { Text(stringResource(android.R.string.cancel)) }
+            },
+        )
     }
 }
 
@@ -299,24 +368,41 @@ private fun FolderTabs(folder: String, unread: Int, onSelect: (String) -> Unit) 
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun MailRow(m: MailSummary, sent: Boolean, onClick: () -> Unit) {
+private fun MailRow(
+    m: MailSummary,
+    sent: Boolean,
+    selecting: Boolean,
+    selected: Boolean,
+    onOpen: () -> Unit,
+    onToggle: () -> Unit,
+) {
     val unread = !sent && !m.seen
     Row(
         verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick)
+            // A long press starts a batch and picks this message; taps pick
+            // too while a batch is open.
+            .combinedClickable(
+                onClick = { if (selecting) onToggle() else onOpen() },
+                onLongClick = onToggle,
+            )
             .padding(vertical = 8.dp, horizontal = 4.dp),
     ) {
-        Box(
-            Modifier
-                .size(8.dp)
-                .background(
-                    if (unread) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surface,
-                    CircleShape,
-                ),
-        )
+        if (selecting) {
+            Checkbox(checked = selected, onCheckedChange = null)
+        } else {
+            Box(
+                Modifier
+                    .size(10.dp)
+                    .background(
+                        if (unread) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surface,
+                        CircleShape,
+                    ),
+            )
+        }
         Spacer(Modifier.width(10.dp))
         Column(Modifier.weight(1f)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -324,6 +410,9 @@ private fun MailRow(m: MailSummary, sent: Boolean, onClick: () -> Unit) {
                     displayAddress(if (sent) m.to else m.from),
                     style = MaterialTheme.typography.bodyLarge,
                     fontWeight = if (unread) FontWeight.Bold else FontWeight.Normal,
+                    // Read mail steps back in color as well as weight: weight
+                    // alone reads as no difference at all on a phone.
+                    color = if (unread) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f, fill = false),
@@ -342,6 +431,7 @@ private fun MailRow(m: MailSummary, sent: Boolean, onClick: () -> Unit) {
                 m.subject.ifEmpty { stringResource(R.string.mail_no_subject) },
                 style = MaterialTheme.typography.bodyMedium,
                 fontWeight = if (unread) FontWeight.SemiBold else FontWeight.Normal,
+                color = if (unread) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
             )
@@ -426,6 +516,30 @@ private fun MessageView(state: MailUiState, viewModel: MailViewModel) {
                             Text(stringResource(R.string.mail_reply))
                         }
                     }
+                    // The sender's key came authenticated with the message, so
+                    // saving needs no typing: name them once and every picker,
+                    // call screen and chat shows the name.
+                    val contactPk = m.peerPk.ifEmpty {
+                        SkymailAddress.pkOfAddress(m.from.substringAfter('<').substringBefore('>')) ?: ""
+                    }
+                    if (open.folder == MailFolder.INBOX && contactPk.isNotEmpty()) {
+                        var saveContact by remember { mutableStateOf(false) }
+                        OutlinedButton(onClick = { saveContact = true }) {
+                            Icon(Icons.Rounded.PersonAdd, contentDescription = null, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(6.dp))
+                            Text(stringResource(R.string.mail_save_contact))
+                        }
+                        if (saveContact) {
+                            SaveContactDialog(
+                                preset = displayAddress(m.from).takeIf { '<' in m.from } ?: "",
+                                onSave = { name ->
+                                    saveContact = false
+                                    viewModel.saveContact(contactPk, name)
+                                },
+                                onDismiss = { saveContact = false },
+                            )
+                        }
+                    }
                     OutlinedButton(onClick = { confirmDelete = true }, enabled = !state.busy) {
                         Icon(Icons.Rounded.Delete, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(6.dp))
@@ -467,10 +581,36 @@ private fun HeaderLine(label: Int, value: String) {
     }
 }
 
+/** Names a key for the shared address book; a blank name never saves. */
+@Composable
+private fun SaveContactDialog(preset: String, onSave: (String) -> Unit, onDismiss: () -> Unit) {
+    var name by remember { mutableStateOf(preset) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(stringResource(R.string.mail_save_contact)) },
+        text = {
+            OutlinedTextField(
+                value = name,
+                onValueChange = { name = it },
+                label = { Text(stringResource(R.string.mail_contact_name)) },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = { onSave(name) }, enabled = name.isNotBlank()) {
+                Text(stringResource(R.string.mail_save_contact))
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text(stringResource(android.R.string.cancel)) }
+        },
+    )
+}
+
 /** What the transport proved about the sender: the From line can be typed by anyone. */
 @Composable
-private fun VerifiedLine(verified: Boolean, peerPk: String) {
-    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(start = 56.dp, bottom = 4.dp)) {
+private fun VerifiedLine(verified: Boolean, peerPk: String) {    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(start = 56.dp, bottom = 4.dp)) {
         Icon(
             if (verified) Icons.Rounded.CheckCircle else Icons.Rounded.Warning,
             contentDescription = null,
@@ -516,18 +656,33 @@ private fun ComposeView(state: MailUiState, viewModel: MailViewModel) {
                 supportingText = { Text(stringResource(R.string.mail_to_hint)) },
                 modifier = Modifier.weight(1f),
             )
-            if (book.isNotEmpty()) {
-                Box {
-                    IconButton(onClick = { pickContact = true }) {
-                        Icon(Icons.Rounded.Contacts, contentDescription = stringResource(R.string.mail_contacts))
-                    }
-                    DropdownMenu(expanded = pickContact, onDismissRequest = { pickContact = false }) {
+            // The picker is the way out of copy-paste, so it stays reachable
+            // even with nothing to pick yet.
+            Box {
+                IconButton(onClick = { pickContact = true }) {
+                    Icon(Icons.Rounded.Contacts, contentDescription = stringResource(R.string.mail_contacts))
+                }
+                DropdownMenu(expanded = pickContact, onDismissRequest = { pickContact = false }) {
+                    if (book.isEmpty()) {
+                        DropdownMenuItem(
+                            text = {
+                                Text(
+                                    stringResource(R.string.mail_no_contacts),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            },
+                            enabled = false,
+                            onClick = {},
+                        )
+                    } else {
                         book.entries.sortedBy { it.value.lowercase() }.forEach { (pk, name) ->
                             DropdownMenuItem(
                                 text = { Text(name) },
                                 onClick = {
                                     pickContact = false
-                                    val addr = SkymailAddress.of(pk) ?: return@DropdownMenuItem
+                                    val suffix = if (draft.skynet) SkymailAddress.SKYNET else SkymailAddress.DMSG
+                                    val addr = SkymailAddress.of(pk, suffix = suffix) ?: return@DropdownMenuItem
                                     viewModel.updateDraft { d ->
                                         d.copy(to = listOf(d.to.trim().trimEnd(','), addr).filter { it.isNotEmpty() }.joinToString(", "))
                                     }
@@ -547,6 +702,28 @@ private fun ComposeView(state: MailUiState, viewModel: MailViewModel) {
             )
         } else {
             TextButton(onClick = { showCc = true }) { Text(stringResource(R.string.mail_add_cc)) }
+        }
+        // The suffix is the sender's choice of network, and they differ in
+        // more than name: dmsg needs no route but relays through a dmsg
+        // server; skynet is a direct route when one exists.
+        Column {
+            SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+                SegmentedButton(
+                    selected = !draft.skynet,
+                    onClick = { viewModel.setViaSkynet(false) },
+                    shape = SegmentedButtonDefaults.itemShape(0, 2),
+                ) { Text("dmsg") }
+                SegmentedButton(
+                    selected = draft.skynet,
+                    onClick = { viewModel.setViaSkynet(true) },
+                    shape = SegmentedButtonDefaults.itemShape(1, 2),
+                ) { Text("skynet") }
+            }
+            Text(
+                stringResource(R.string.mail_via_hint),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
         OutlinedTextField(
             value = draft.subject,
@@ -763,7 +940,7 @@ private fun shortDate(rfc3339: String): String = runCatching {
 
 private fun copy(context: Context, text: String) {
     val clipboard = context.getSystemService(ClipboardManager::class.java)
-    clipboard?.setPrimaryClip(ClipData.newPlainText("Skymail", text))
+    clipboard?.setPrimaryClip(ClipData.newPlainText("SkyMail", text))
 }
 
 private fun share(context: Context, text: String) {

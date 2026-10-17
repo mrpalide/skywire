@@ -34,6 +34,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.InterruptedIOException
 import java.util.Base64
 
 /** A file picked for the draft, read in full: a Skymail message is 1 MiB by default. */
@@ -46,6 +47,9 @@ data class MailDraft(
     val body: String = "",
     val inReplyTo: String = "",
     val attachments: List<DraftAttachment> = emptyList(),
+    /** The network a contact or a bare key is addressed over. A typed
+     * address keeps the suffix it was given. */
+    val skynet: Boolean = false,
 )
 
 data class OpenMail(
@@ -72,6 +76,8 @@ data class MailUiState(
     val settingsOpen: Boolean = false,
     /** A settings change or a delete is in flight. */
     val busy: Boolean = false,
+    /** Message ids picked in the folder shown, for a batch delete. */
+    val selection: Set<String> = emptySet(),
     /** A one-off line for the snackbar, then cleared. */
     val notice: String? = null,
 ) {
@@ -90,6 +96,7 @@ data class MailUiState(
 class MailViewModel(app: Application) : AndroidViewModel(app) {
 
     private val api = VisorApi.get(app)
+    private val skychat = com.skycoin.skywire.api.SkychatApi.get(app)
     private val mutable = MutableStateFlow(MailUiState())
     val uiState: StateFlow<MailUiState> = mutable.asStateFlow()
 
@@ -113,7 +120,8 @@ class MailViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun selectFolder(folder: String) {
-        mutable.update { it.copy(folder = folder) }
+        // A selection belongs to the folder it was made in.
+        mutable.update { it.copy(folder = folder, selection = emptySet()) }
         refresh()
     }
 
@@ -229,6 +237,8 @@ class MailViewModel(app: Application) : AndroidViewModel(app) {
         mutable.update { s -> s.copy(draft = s.draft?.let(change)) }
     }
 
+    fun setViaSkynet(on: Boolean) = updateDraft { it.copy(skynet = on) }
+
     fun discardDraft() {
         mutable.update { it.copy(draft = null, lastSend = null) }
     }
@@ -241,9 +251,11 @@ class MailViewModel(app: Application) : AndroidViewModel(app) {
             mutable.update { s ->
                 val draft = s.draft ?: return@update s
                 val all = draft.attachments + picked
-                // Base64 grows a file by a third, and the text and headers ride along.
-                if (all.sumOf { it.bytes.size.toLong() } * 4 / 3 + ENVELOPE_BYTES > limit) {
-                    s.copy(notice = string(R.string.mail_attachments_too_big, formatBytes(limit)))
+                // Base64 grows a file by a third, and the text and headers
+                // ride along. The wire size is what the receiver enforces.
+                val encoded = all.sumOf { it.bytes.size.toLong() } * 4 / 3 + ENVELOPE_BYTES
+                if (encoded > limit) {
+                    s.copy(notice = string(R.string.mail_attachments_too_big, formatBytes(encoded), formatBytes(limit)))
                 } else {
                     s.copy(draft = draft.copy(attachments = all))
                 }
@@ -256,9 +268,14 @@ class MailViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun send() {
-        val draft = mutable.value.draft ?: return
-        val to = parseRecipients(draft.to)
-        val cc = parseRecipients(draft.cc)
+        val s = mutable.value
+        val draft = s.draft ?: return
+        // The button's enabled state lags this update by a frame; a second
+        // tap in that window would send the mail twice.
+        if (s.sending) return
+        val suffix = if (draft.skynet) SkymailAddress.SKYNET else SkymailAddress.DMSG
+        val to = parseRecipients(draft.to, suffix)
+        val cc = parseRecipients(draft.cc, suffix)
         val bad = (to + cc).filter { it.second == null }.map { it.first }
         when {
             bad.isNotEmpty() -> {
@@ -294,8 +311,91 @@ class MailViewModel(app: Application) : AndroidViewModel(app) {
                     refreshNow()
                 }
                 .onFailure { e ->
-                    mutable.update { it.copy(sending = false, notice = string(R.string.mail_send_failed, e.message.orEmpty())) }
+                    // A timeout is not a verdict: the visor answers only
+                    // after delivering and keeps going without us, so the
+                    // mail may still arrive.
+                    val notice = if (e is InterruptedIOException) {
+                        string(R.string.mail_send_unknown)
+                    } else {
+                        string(R.string.mail_send_failed, e.message.orEmpty())
+                    }
+                    mutable.update { it.copy(sending = false, notice = notice) }
                 }
+        }
+    }
+
+    // --- batch selection ---
+
+    fun toggleSelect(id: String) {
+        mutable.update { s ->
+            s.copy(selection = if (id in s.selection) s.selection - id else s.selection + id)
+        }
+    }
+
+    fun selectAll() {
+        val ids = mutable.value.messages?.map { it.id } ?: return
+        mutable.update { it.copy(selection = ids.toSet()) }
+    }
+
+    /** Flips the picks within the folder shown. */
+    fun invertSelection() {
+        val ids = mutable.value.messages?.map { it.id }?.toSet() ?: return
+        mutable.update { s -> s.copy(selection = ids - s.selection) }
+    }
+
+    fun clearSelection() = mutable.update { it.copy(selection = emptySet()) }
+
+    /** Deletes every picked message in the folder shown, one call each. */
+    fun deleteSelected() {
+        val s = mutable.value
+        if (s.busy || s.selection.isEmpty()) return
+        val folder = s.folder
+        val ids = s.selection.toList()
+        mutable.update { it.copy(busy = true) }
+        viewModelScope.launch {
+            val failed = ids.count { id -> runCatching { api.mailDelete(folder, id) }.isFailure }
+            val gone = ids.toSet()
+            mutable.update { st ->
+                st.copy(
+                    busy = false,
+                    selection = emptySet(),
+                    inbox = if (folder == MailFolder.INBOX) st.inbox?.filterNot { it.id in gone } else st.inbox,
+                    sent = if (folder == MailFolder.SENT) st.sent?.filterNot { it.id in gone } else st.sent,
+                    notice = if (failed == 0) {
+                        string(R.string.mail_batch_deleted, ids.size)
+                    } else {
+                        string(R.string.mail_batch_delete_failed, failed, ids.size)
+                    },
+                )
+            }
+            refreshNow()
+        }
+    }
+
+    // --- contacts ---
+
+    /**
+     * Names a public key in the address book every surface shares — compose's
+     * picker, the call screens, chat itself. The book is written through
+     * skychat, so it keeps working there; the in-memory copy moves at once
+     * rather than at the watcher's next rare refresh.
+     */
+    fun saveContact(pk: String, name: String, onDone: () -> Unit = {}) {
+        if (pk.isBlank() || name.isBlank()) return
+        viewModelScope.launch {
+            runCatching {
+                skychat.setContact(com.skycoin.skywire.core.SkychatProfile.baseUrl(
+                    com.skycoin.skywire.core.SkychatProfile.DEFAULT_PORT,
+                ), pk, name.trim())
+            }.onSuccess {
+                com.skycoin.skywire.core.VoiceCalls.setNames(
+                    com.skycoin.skywire.core.VoiceCalls.addressBook.value + (pk to name.trim()),
+                )
+                mutable.update { it.copy(notice = string(R.string.mail_contact_saved)) }
+                onDone()
+            }.onFailure { e ->
+                mutable.update { it.copy(notice = string(R.string.mail_contact_failed, e.message.orEmpty())) }
+            }
         }
     }
 
@@ -342,7 +442,7 @@ class MailViewModel(app: Application) : AndroidViewModel(app) {
         val link = DeepLinks.pendingMail.value ?: return
         val summary = mutable.value.inbox?.firstOrNull { it.id == link.id }
         if (summary != null) {
-            mutable.update { it.copy(folder = MailFolder.INBOX, draft = null, settingsOpen = false) }
+            mutable.update { it.copy(folder = MailFolder.INBOX, draft = null, settingsOpen = false, selection = emptySet()) }
             open(MailFolder.INBOX, summary)
         }
         if (summary != null || mutable.value.inbox != null) DeepLinks.mailLinkHandled(link)
@@ -358,9 +458,9 @@ class MailViewModel(app: Application) : AndroidViewModel(app) {
 
     // --- helpers ---
 
-    private fun parseRecipients(text: String): List<Pair<String, String?>> =
+    private fun parseRecipients(text: String, suffix: String): List<Pair<String, String?>> =
         text.split(',', ';', ' ', '\n').map { it.trim() }.filter { it.isNotEmpty() }
-            .map { it to SkymailAddress.recipient(it) }
+            .map { it to SkymailAddress.recipient(it, suffix) }
 
     private fun readAttachment(uri: Uri): DraftAttachment? = runCatching {
         val resolver = getApplication<Application>().contentResolver

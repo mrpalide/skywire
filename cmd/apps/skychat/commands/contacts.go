@@ -17,10 +17,8 @@ package commands
 import (
 	"encoding/json"
 	"net/http"
-	"path/filepath"
 
 	"github.com/skycoin/skywire/pkg/skychat/contacts"
-	"github.com/skycoin/skywire/pkg/skyenv"
 )
 
 // contactStore is the open address book, or nil when it could not be opened —
@@ -39,17 +37,10 @@ func registerContactHandlers(mux *http.ServeMux) {
 }
 
 // contactStorePath is where the book lives: beside the app's other state, in
-// its own work dir. Mirrors openHistoryStore's derivation so a --standalone
-// run (no visor, no ProcWorkDir) still lands somewhere sensible.
+// its own work dir, named for the identity — see identity.go for why the
+// visor's key is part of the name.
 func contactStorePath() string {
-	workDir := ""
-	if appCl != nil {
-		workDir = appCl.Config().ProcWorkDir
-	}
-	if workDir == "" {
-		workDir = skyenv.LocalPath
-	}
-	return filepath.Join(workDir, "skychat-contacts.json")
+	return identityStatePath(stateDir(), identityScope(), "skychat-contacts.json")
 }
 
 // openContactStore opens the address book at path, logging and continuing on
@@ -84,6 +75,14 @@ func contactsHandler(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
+		}
+		// Forgetting someone ends the standing consent too: without this the
+		// acceptance outlives the contact, and a later first message is let
+		// in without ever prompting again — the blacklist the only lever left.
+		if stored == "" && privacyStore != nil {
+			if err := privacyStore.Unaccept(body.PK); err != nil {
+				appLog("Privacy: unaccept %s: %v", body.PK, err)
+			}
 		}
 		writeJSON(w, map[string]string{"pk": body.PK, "name": stored})
 	default:
